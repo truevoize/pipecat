@@ -83,9 +83,39 @@ class TurnDetection(BaseModel):
 
     Parameters:
         type: Detection type, must be "server_vad" or None for manual.
+        threshold: VAD activation threshold (0.1-0.9). Default: 0.85.
+        silence_duration_ms: How long the user must be silent before turn ends (0-10000).
+        prefix_padding_ms: Amount of audio in ms to include before speech start (0-10000). Default: 333.
+        idle_timeout_ms: Proactively re-engage user if no speech detected for this ms.
     """
 
     type: Literal["server_vad"] | None = "server_vad"
+    threshold: float | None = None
+    silence_duration_ms: int | None = None
+    prefix_padding_ms: int | None = None
+    idle_timeout_ms: int | None = None
+
+
+#
+# Reasoning configuration
+#
+
+
+class ReasoningConfiguration(BaseModel):
+    """Configuration for model reasoning effort."""
+
+    effort: Literal["high", "none"] | str | None = "high"
+
+
+#
+# Resumption configuration
+#
+
+
+class ResumptionConfiguration(BaseModel):
+    """Configuration for session resumption."""
+
+    enabled: bool | None = None
 
 
 #
@@ -102,6 +132,7 @@ class InputAudioTranscription(BaseModel):
 
     model: Literal["grok-transcribe"] | str = "grok-transcribe"
     language_hint: str | None = None
+    keyterms: list[str] | None = None
 
 
 class AudioInput(BaseModel):
@@ -110,10 +141,12 @@ class AudioInput(BaseModel):
     Parameters:
         format: The format configuration for input audio.
         transcription: Optional user-audio transcription configuration.
+        transport: Wire path for input audio ("json" or "binary").
     """
 
     format: PCMAudioFormat | PCMUAudioFormat | PCMAAudioFormat | None = None
     transcription: InputAudioTranscription | None = None
+    transport: Literal["json", "binary"] | None = None
 
 
 class AudioOutput(BaseModel):
@@ -121,9 +154,13 @@ class AudioOutput(BaseModel):
 
     Parameters:
         format: The format configuration for output audio.
+        speed: Playback speed multiplier (0.7-1.5).
+        transport: Wire path for output audio ("json" or "binary").
     """
 
     format: PCMAudioFormat | PCMUAudioFormat | PCMAAudioFormat | None = None
+    speed: float | None = None
+    transport: Literal["json", "binary"] | None = None
 
 
 class AudioConfiguration(BaseModel):
@@ -222,10 +259,13 @@ class SessionProperties(BaseModel):
         instructions: System instructions for the assistant.
         voice: The voice the model uses to respond. Options: ara, rex, sal, eve, leo.
             Defaults to "ara".
+        reasoning: Model reasoning effort configuration.
         turn_detection: Configuration for turn detection. Defaults to server-side VAD.
             Set to None for manual turn detection.
         audio: Configuration for input and output audio.
         tools: Available tools for the assistant (web_search, x_search, file_search, function).
+        replace: Map of phrases to spoken pronunciation substitutions before TTS.
+        resumption: Configuration for session resumption across disconnects.
     """
 
     # Needed to support ToolSchema in tools field.
@@ -233,6 +273,7 @@ class SessionProperties(BaseModel):
 
     instructions: str | None = None
     voice: GrokVoice | str | None = "ara"
+    reasoning: ReasoningConfiguration | None = None
     turn_detection: TurnDetection | None = Field(
         default_factory=lambda: TurnDetection(type="server_vad")
     )
@@ -241,6 +282,8 @@ class SessionProperties(BaseModel):
     # tools (the validator below normalizes that to a ToolsSchema); a list of
     # provider-native GrokTool objects passes through.
     tools: ToolsSchema | list[FunctionSchema | DirectFunction] | list[GrokTool] | None = None
+    replace: dict[str, str] | None = None
+    resumption: ResumptionConfiguration | None = None
 
     @field_validator("tools", mode="before")
     @classmethod
@@ -294,7 +337,7 @@ class ConversationItem(BaseModel):
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4().hex))
     object: Literal["realtime.item"] | None = None
-    type: Literal["message", "function_call", "function_call_output"]
+    type: Literal["message", "function_call", "function_call_output", "force_message"]
     status: Literal["completed", "in_progress", "incomplete"] | None = None
     role: Literal["user", "assistant", "system", "tool"] | None = None
     content: list[ItemContent] | None = None
@@ -302,6 +345,7 @@ class ConversationItem(BaseModel):
     name: str | None = None
     arguments: str | None = None
     output: str | None = None
+    interruptible: bool | None = None
 
 
 class RealtimeConversation(BaseModel):
@@ -321,9 +365,11 @@ class ResponseProperties(BaseModel):
 
     Parameters:
         modalities: Output modalities for the response (text, audio, or both).
+        instructions: Optional per-response system instructions override.
     """
 
     modalities: list[Literal["text", "audio"]] | None = ["text", "audio"]
+    instructions: str | None = None
 
 
 #
@@ -465,6 +511,20 @@ class ServerEvent(BaseModel):
     type: str
 
 
+class SessionCreatedEvent(ServerEvent):
+    """Event indicating a session has been created.
+
+    This is the first event received after connecting.
+
+    Parameters:
+        type: Event type, always "session.created".
+        session: The created session properties.
+    """
+
+    type: Literal["session.created"] = "session.created"
+    session: SessionProperties
+
+
 class SessionUpdatedEvent(ServerEvent):
     """Event indicating a session has been updated.
 
@@ -473,7 +533,7 @@ class SessionUpdatedEvent(ServerEvent):
         session: The updated session properties.
     """
 
-    type: Literal["session.updated"]
+    type: Literal["session.updated"] = "session.updated"
     session: SessionProperties
 
 
@@ -515,6 +575,20 @@ class ConversationItemInputAudioTranscriptionCompleted(ServerEvent):
     """
 
     type: Literal["conversation.item.input_audio_transcription.completed"]
+    item_id: str
+    transcript: str
+
+
+class ConversationItemInputAudioTranscriptionUpdated(ServerEvent):
+    """Event indicating an interim/updated transcription chunk.
+
+    Parameters:
+        type: Event type, always "conversation.item.input_audio_transcription.updated".
+        item_id: ID of the conversation item being transcribed.
+        transcript: Current cumulative transcription text.
+    """
+
+    type: Literal["conversation.item.input_audio_transcription.updated"]
     item_id: str
     transcript: str
 
@@ -845,10 +919,12 @@ class ErrorEvent(ServerEvent):
 _server_event_types = {
     "error": ErrorEvent,
     "ping": PingEvent,
+    "session.created": SessionCreatedEvent,
     "session.updated": SessionUpdatedEvent,
     "conversation.created": ConversationCreated,
     "conversation.item.added": ConversationItemAdded,
     "conversation.item.input_audio_transcription.completed": ConversationItemInputAudioTranscriptionCompleted,
+    "conversation.item.input_audio_transcription.updated": ConversationItemInputAudioTranscriptionUpdated,
     "input_audio_buffer.speech_started": InputAudioBufferSpeechStarted,
     "input_audio_buffer.speech_stopped": InputAudioBufferSpeechStopped,
     "input_audio_buffer.committed": InputAudioBufferCommitted,

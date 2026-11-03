@@ -96,6 +96,7 @@ class RawAudioTrack(AudioStreamTrack):
         self._start = time.time()
         # Queue of (bytes, future), broken into 10ms sub chunks as needed
         self._chunk_queue = deque()
+        self._remainder = bytearray()
 
     def add_audio_bytes(self, audio_bytes: bytes):
         """Add audio bytes to the buffer for transmission.
@@ -105,12 +106,23 @@ class RawAudioTrack(AudioStreamTrack):
 
         Returns:
             A Future that completes when the data is processed.
-
-        Raises:
-            ValueError: If audio bytes are not a multiple of 10ms size.
         """
-        if len(audio_bytes) % self._bytes_per_10ms != 0:
-            raise ValueError("Audio bytes must be a multiple of 10ms size.")
+        if self._remainder:
+            audio_bytes = bytes(self._remainder) + audio_bytes
+            self._remainder.clear()
+
+        total_len = len(audio_bytes)
+        remainder_len = total_len % self._bytes_per_10ms
+        if remainder_len != 0:
+            usable_len = total_len - remainder_len
+            self._remainder.extend(audio_bytes[usable_len:])
+            audio_bytes = audio_bytes[:usable_len]
+
+        if not audio_bytes:
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(True)
+            return future
+
         future = asyncio.get_running_loop().create_future()
 
         # Break input into 10ms chunks
@@ -424,15 +436,16 @@ class SmallWebRTCClient:
                 continue
 
             # Resample if needed, otherwise use the frame as-is. The resampler
-            # also converts to the configured channel layout, so frames whose
-            # layout doesn't already match must go through it even when the
-            # rate already matches (e.g. aiortc decodes to stereo regardless
-            # of the source track) — otherwise interleaved bytes get labeled
-            # with the wrong channel count.
+            # also converts to the configured channel layout and sample format (s16),
+            # so frames whose layout or format doesn't already match must go through it
+            # even when the rate already matches (e.g. aiortc decodes to fltp or stereo
+            # regardless of the source track) — otherwise float32 values cast directly to
+            # int16 truncate to zero.
             frames_to_process = (
                 self._audio_in_resampler.resample(frame)
                 if frame.sample_rate != self._in_sample_rate
                 or frame.layout.name != self._audio_in_layout
+                or frame.format.name != "s16"
                 else [frame]
             )
 

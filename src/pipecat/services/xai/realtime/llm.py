@@ -32,6 +32,7 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     InputAudioRawFrame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
@@ -299,6 +300,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         self._messages_added_manually = {}
         self._pending_function_calls = {}
         self._completed_tool_calls = set()
+        self._conversation_id = None
 
         self._register_event_handler("on_conversation_item_created")
         self._register_event_handler("on_conversation_item_updated")
@@ -566,6 +568,10 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             model = assert_given(self._settings.model)
             uri = f"{self.base_url}?model={quote(model, safe='')}"
 
+            sp = self._settings.session_properties
+            if sp and sp.resumption and sp.resumption.enabled and self._conversation_id:
+                uri += f"&conversation_id={quote(self._conversation_id, safe='')}"
+
             self._websocket = await websocket_connect(
                 uri=uri,
                 additional_headers={
@@ -670,6 +676,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             if evt.type == "ping":
                 # Ignore ping events (keep-alive)
                 pass
+            elif evt.type == "session.created":
+                await self._handle_evt_session_created(evt)
             elif evt.type == "conversation.created":
                 await self._handle_evt_conversation_created(evt)
             elif evt.type == "session.updated":
@@ -693,6 +701,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                 pass
             elif evt.type == "conversation.item.added":
                 await self._handle_evt_conversation_item_added(evt)
+            elif evt.type == "conversation.item.input_audio_transcription.updated":
+                await self._handle_evt_input_audio_transcription_updated(evt)
             elif evt.type == "conversation.item.input_audio_transcription.completed":
                 await self._handle_evt_input_audio_transcription_completed(evt)
             elif evt.type == "response.done":
@@ -731,8 +741,16 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                     await self._handle_evt_error(evt)
                     return
 
+    async def _handle_evt_session_created(self, evt):
+        """Handle session.created event - first event after connecting."""
+        if hasattr(evt, "session") and hasattr(evt.session, "id"):
+            self._session_id = evt.session.id
+        await self._send_session_update()
+
     async def _handle_evt_conversation_created(self, evt):
         """Handle conversation.created event - first event after connecting."""
+        if hasattr(evt, "conversation") and hasattr(evt.conversation, "id"):
+            self._conversation_id = evt.conversation.id
         await self._send_session_update()
 
     async def _handle_evt_response_created(self, evt):
@@ -793,6 +811,17 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         if evt.item.role == "assistant":
             self._current_assistant_response = evt.item
             await self.push_frame(LLMFullResponseStartFrame())
+
+    async def _handle_evt_input_audio_transcription_updated(self, evt):
+        """Handle input audio transcription updated event."""
+        await self._call_event_handler("on_conversation_item_updated", evt.item_id, None)
+
+        transcript = evt.transcript.strip() if evt.transcript else ""
+        if transcript:
+            await self.push_frame(
+                InterimTranscriptionFrame(transcript, "", time_now_iso8601(), result=evt),
+                FrameDirection.UPSTREAM,
+            )
 
     async def _handle_evt_input_audio_transcription_completed(self, evt):
         """Handle input audio transcription completed event."""
@@ -936,7 +965,15 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                 f"{adapter.get_messages_for_logging(self._context)}"
             )
 
-            llm_invocation_params = adapter.get_llm_invocation_params(self._context)
+            system_instruction = (
+                assert_given(self._settings.system_instruction)
+                if is_given(self._settings.system_instruction)
+                else None
+            )
+            llm_invocation_params = adapter.get_llm_invocation_params(
+                self._context,
+                system_instruction=system_instruction,
+            )
             messages = llm_invocation_params["messages"]
 
             for item in messages:

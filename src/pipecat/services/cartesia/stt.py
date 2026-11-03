@@ -26,6 +26,8 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
@@ -322,9 +324,9 @@ class CartesiaSTTService(WebsocketSTTService):
         """
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, VADUserStartedSpeakingFrame):
+        if isinstance(frame, (VADUserStartedSpeakingFrame, UserStartedSpeakingFrame)):
             await self._start_metrics()
-        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+        elif isinstance(frame, (VADUserStoppedSpeakingFrame, UserStoppedSpeakingFrame)):
             # Send finalize command to flush the transcription session
             if self._websocket and self._websocket.state is State.OPEN:
                 await self._websocket.send("finalize")
@@ -494,6 +496,7 @@ class CartesiaSTTService(WebsocketSTTService):
                         time_now_iso8601(),
                         language,
                         result=data,
+                        finalized=True,
                     )
                 )
                 await self._handle_transcription(transcript, is_final, language)
